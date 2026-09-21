@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+<defs><radialGradient id="g"><stop stop-color="#143d2c"/><stop offset="1" stop-color="#090c12"/></radialGradient><pattern id="p" width="50" height="50" patternUnits="userSpaceOnUse"><path d="M50 0H0V50" fill="none" stroke="#37e5a0" stroke-opacity=".05"/></pattern></defs>
+<path fill="#090c12" d="M0 0h1200v630H0z"/><ellipse cx="1000" cy="320" rx="500" ry="400" fill="url(#g)"/><path fill="url(#p)" d="M0 0h1200v630H0z"/>
+<rect x="72" y="64" width="54" height="54" rx="12" fill="#37e5a0"/><path d="m83 80 7 23h6l4-12 4 12h6l7-23h-6l-4 14-4-14h-5l-4 14-4-14z" fill="#091d14"/>
+<text x="143" y="102" fill="#ecf2f7" font-family="DejaVu Sans,sans-serif" font-size="32" font-weight="bold">watchtower.</text>
+<text x="73" y="200" fill="#37e5a0" font-family="DejaVu Sans Mono,monospace" font-size="15" letter-spacing="3">GAMES WATCHTOWER × ECOSYSTEM SHARE</text>
+<text x="68" y="298" fill="#ecf2f7" font-family="DejaVu Sans,sans-serif" font-size="66" font-weight="bold">100 NFT = 25%</text>
+<text x="68" y="385" fill="#37e5a0" font-family="DejaVu Sans,sans-serif" font-size="66" font-weight="bold">of net profit.</text>
+<text x="73" y="451" fill="#8c9baf" font-family="DejaVu Sans,sans-serif" font-size="22">4 games on Solana. 1 operating system. 0 hidden numbers.</text>
+<path d="M72 523h1056" stroke="#243b30"/><circle cx="79" cy="559" r="4" fill="#37e5a0"/>
+<text x="96" y="564" fill="#a5b5ab" font-family="DejaVu Sans Mono,monospace" font-size="14">PLANNED PRESALE · Q4 2026</text>
+<text x="935" y="564" fill="#708879" font-family="DejaVu Sans Mono,monospace" font-size="14">LEO GAMES STUDIO</text>
+</svg>
