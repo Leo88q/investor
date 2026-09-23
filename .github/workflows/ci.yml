@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  push:
+    branches: ["arena/**", "main"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build, unit tests and gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: unit tests (dividend math, rendering, registry)
+        run: npm run test:unit
+      - name: no numbers without a source
+        run: npm run test:numbers
+      - name: no secrets or private keys
+        run: npm run test:secrets
+      - name: build
+        run: npm run build
+        env:
+          # Absolute canonical/OG/sitemap URLs; a placeholder is enough for CI.
+          VITE_SITE_URL: https://investor.example.test/
+      - name: bundle budget (JS < 200 kB gzip, CSS < 40 kB gzip)
+        run: npm run test:bundle
+      - name: structured data is present and honest
+        run: |
+          node -e '
+            const fs = require("fs");
+            const html = fs.readFileSync("dist/index.html", "utf8");
+            const match = html.match(/<script type="application\/ld\+json">(.*?)<\/script>/s);
+            if (!match) { console.error("JSON-LD missing"); process.exit(1); }
+            const data = JSON.parse(match[1]);
+            const offer = data["@graph"].find((node) => node["@type"] === "Product").offers;
+            if (offer.availability.includes("InStock")) {
+              console.error("sale is closed: availability must not claim InStock");
+              process.exit(1);
+            }
+            console.log("JSON-LD OK:", offer.price, offer.priceCurrency, offer.availability);
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+
+  e2e:
+    name: browser tests (chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: start the hub fixture
+        run: |
+          node scripts/dev-hub.mjs &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:5174/api/health && break
+            sleep 1
+          done
+      - name: browser tests (form endpoint not configured)
+        run: |
+          npm run dev -- --port 5173 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:5173/ > /dev/null && break
+            sleep 1
+          done
+          npx playwright test
+          pkill -f "vite --host 0.0.0.0" || true
+          sleep 2
+      - name: form contract against a mocked endpoint
+        run: |
+          VITE_FORM_ENDPOINT=/api/waitlist npm run dev -- --port 5173 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:5173/ > /dev/null && break
+            sleep 1
+          done
+          TEST_FORM=1 npx playwright test tests/browser/form.spec.js
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: .playwright
+          retention-days: 7
+
+  history:
+    name: repository history scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: no key material in the git history
+        run: |
+          if git log -p --all | grep -nE 'BEGIN [A-Z ]*PRIVATE KEY|[1-9A-HJ-NP-Za-km-z]{80,}'; then
+            echo "key-like material found in history"; exit 1
+          fi
+          echo "history clean"
+      - name: no private keys in the working tree
+        run: npm run test:secrets
+        continue-on-error: false
