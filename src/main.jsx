@@ -32,17 +32,238 @@ import {
   LoaderCircle,
   Maximize2,
   Minimize2,
+  RefreshCw,
+  AlertTriangle,
+  Server,
+  Scale,
+  Banknote,
+  ShieldAlert,
+  Clock,
+  Link2,
+  Link2Off,
+  Gauge,
+  Gavel,
+  Boxes,
 } from "lucide-react";
 import { content } from "./content";
-import { config, saleReady } from "./config";
-import { calculateShare, getLanguage, money } from "./math";
+import { config, saleReady, sharePerNft } from "./config";
+import {
+  calculateShare,
+  getLanguage,
+  money,
+  moneyOrDash,
+  percent,
+  stampUtc,
+  nextSnapshot,
+  isoDay,
+  snapshotDates,
+  quarterForMonth,
+} from "./math";
+import { NUMBERS, QUALITY, describeSource } from "./numbers";
+import {
+  loadDashboardData,
+  buildMetrics,
+  buildLeadPayload,
+  readConsents,
+  writeConsents,
+  normalizeEcosystemStatus,
+  normalizeSnapshots,
+  adapterInventory,
+  isDemo,
+  SOURCE_LABEL,
+} from "./api";
 import "./styles.css";
 
 const navIds = ["ecosystem", "watchtower", "math", "roadmap"];
 const gameImages = ["ares", "farming", "neon", "guttercaps"];
-const fundAmounts = [30000, 25000, 25000, 15000, 5000];
 const fundColors = ["#37e5a0", "#a78bfa", "#71b8d1", "#ffb85c", "#637087"];
 const cx = (...classes) => classes.filter(Boolean).join(" ");
+
+/* ------------------------------------------------------------------ *
+ * Honest-data primitives.
+ *
+ * Every number on the page is rendered through one of these. They are the
+ * only components allowed to print a figure, so the dataQuality badge, the
+ * asOf stamp and the source line can never be forgotten.
+ * ------------------------------------------------------------------ */
+
+const QUALITY_COLOR = {
+  [QUALITY.COMPLETE]: "green",
+  [QUALITY.PARTIAL]: "orange",
+  [QUALITY.UNAVAILABLE]: "gray",
+};
+
+/** Registry-backed metric: value + source + asOf + quality, all declarative. */
+const staticMetric = (token) => {
+  const entry = NUMBERS[token];
+  if (!entry) return null;
+  return {
+    id: token,
+    value: entry.value,
+    quality: entry.quality,
+    asOf: entry.asOf,
+    demo: Boolean(entry.demo),
+    source: entry.source,
+    note: entry.note || "",
+    formula: entry.formula || "",
+  };
+};
+
+function QualityBadge({ quality, t, className = "" }) {
+  const key = QUALITY_COLOR[quality] ? quality : QUALITY.UNAVAILABLE;
+  return (
+    <Badge color={QUALITY_COLOR[key]} dot className={cx("quality-badge", className)}>
+      {t.data.quality[key]}
+    </Badge>
+  );
+}
+
+function DemoChip({ t }) {
+  return (
+    <span className="demo-chip" title={t.data.demoNote}>
+      {t.data.demo}
+    </span>
+  );
+}
+
+/**
+ * The audit trail under a figure: source, asOf (UTC), formula, quality.
+ * Collapsed behind a keyboard-reachable toggle so it never crowds the layout.
+ */
+function MetricTrace({ metric, t, formula, extra }) {
+  const [open, setOpen] = useState(false);
+  const asOf = stampUtc(metric && metric.asOf);
+  return (
+    <span className="metric-trace-wrap">
+      <button
+        type="button"
+        className="metric-info"
+        aria-expanded={open}
+        aria-label={`${t.data.showSource}: ${metric && metric.id ? metric.id : ""}`}
+        onClick={() => setOpen(!open)}
+      >
+        <Info size={11} />
+      </button>
+      <span className="metric-trace" hidden={!open} role="note">
+        <span>
+          <b>{t.data.source}</b> {metric && metric.source}
+        </span>
+        <span>
+          <b>{t.data.asOf}</b> {asOf || "—"}{" "}
+          <span className="mono">({t.data.timezone})</span>
+        </span>
+        {(formula || (metric && metric.formula)) && (
+          <span>
+            <b>{t.data.formula}</b>{" "}
+            <code>{formula || metric.formula}</code>
+          </span>
+        )}
+        {metric && metric.note && <span>{metric.note}</span>}
+        {metric && metric.demo && <span>{t.data.demoNote}</span>}
+        {extra}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * A single figure. `format` decides the notation, never the value.
+ * `null` renders as an em dash and an `unavailable` badge — "no data" and
+ * "zero" are different facts and must never look the same.
+ */
+function Metric({
+  token,
+  metric,
+  t,
+  format = (v) => String(v),
+  className = "",
+  badge = true,
+  trace = true,
+  as = "span",
+  formula,
+  children,
+}) {
+  const record = metric || staticMetric(token);
+  const empty = !record || record.value === null || record.value === undefined;
+  const Tag = as;
+  const quality = empty ? QUALITY.UNAVAILABLE : record.quality;
+  return (
+    <Tag
+      className={cx("metric", className)}
+      data-metric={record ? record.id : token || ""}
+      data-quality={quality}
+      data-demo={record && record.demo ? "true" : "false"}
+    >
+      <span className="metric-value">
+        {empty ? "—" : format(record.value)}
+        {children}
+      </span>
+      {badge && <QualityBadge quality={quality} t={t} />}
+      {record && record.demo && record.value !== null && <DemoChip t={t} />}
+      {trace && (
+        <MetricTrace metric={record} t={t} formula={formula} />
+      )}
+    </Tag>
+  );
+}
+
+/**
+ * Banner that states, once per section, whether the figures below come from
+ * the live hub, from its mock mode, or not at all.
+ */
+function DataStateBar({ state, reason, t, onRetry, updatedAt, demo }) {
+  if (state === "loading") {
+    return (
+      <div className="data-state loading">
+        <LoaderCircle className="spin" size={14} />
+        {t.data.loading}
+      </div>
+    );
+  }
+  if (state === "ready" && demo) {
+    return (
+      <div className="data-state demo">
+        <AlertTriangle size={14} />
+        <span>{t.data.mockBanner}</span>
+        {updatedAt && (
+          <span className="data-stamp mono">
+            <Clock size={12} />
+            {t.data.updated}: {stampUtc(updatedAt)}
+          </span>
+        )}
+      </div>
+    );
+  }
+  if (state === "ready") {
+    return (
+      <div className="data-state ready">
+        <Link2 size={14} />
+        <span>{t.data.readOnly}</span>
+        {updatedAt && (
+          <span className="data-stamp mono">
+            <Clock size={12} />
+            {t.data.updated}: {stampUtc(updatedAt)}
+          </span>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="data-state unavailable" role="status">
+      <Link2Off size={14} />
+      <span>
+        <b>{t.data.unavailableTitle}.</b>{" "}
+        {t.data.reasons[reason] || t.data.reasons.network_error}
+      </span>
+      {onRetry && (
+        <button type="button" className="text-button" onClick={onRetry}>
+          <RefreshCw size={12} />
+          {t.data.retry || t.hub.retry}
+        </button>
+      )}
+    </div>
+  );
+}
 function Logo({ small = false }) {
   return (
     <span className={cx("brand", small && "small")}>
@@ -134,11 +355,36 @@ function Chart({ mini = false }) {
   );
 }
 
-function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
+function Dashboard({ t, compact = false, initialTab = 0, onTabChange, data }) {
   const [tab, setTab] = useState(initialTab);
   const [expanded, setExpanded] = useState(false);
   const uid = useId();
   const d = t.dashboard;
+  const live = data && data.state === "ready";
+  const metrics = (data && data.metrics) || {};
+  const gameRows = t.games.map((game, i) => {
+    const apiGame =
+      live && Array.isArray(data.games)
+        ? data.games.find(
+            (entry) =>
+              entry && (entry.name === game.name || entry.id === gameImages[i]),
+          )
+        : null;
+    return {
+      name: game.name,
+      stage: game.stage,
+      color: fundColors[i],
+      quality: apiGame
+        ? apiGame.dataQuality || QUALITY.PARTIAL
+        : QUALITY.UNAVAILABLE,
+      demo: Boolean(data && data.demo) && Boolean(apiGame),
+      players: apiGame ? apiGame.players : null,
+      volume: apiGame ? apiGame.volume : null,
+      source: apiGame ? `${SOURCE_LABEL.report} · games[]` : null,
+    };
+  });
+  const funnelStages = (live && data.funnel) || null;
+  const channelNames = ["SEO / GEO", "X / Blinks", "Shorts / TikTok / Reels", "Whale radar", "TipLink"];
   const tabIcons = [LayoutDashboard, ChartNoAxesCombined, Users, Radio];
   function choose(i) {
     setTab(i);
@@ -231,9 +477,7 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
                 <div className="dash-kpis">
                   <div>
                     <span>{d.games}</span>
-                    <strong>
-                      4 <small>games</small>
-                    </strong>
+                    <Metric token="games" t={t} className="dash-number" />
                     <em>
                       <i />
                       {d.integration}
@@ -241,9 +485,7 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
                   </div>
                   <div>
                     <span>{d.sources}</span>
-                    <strong>
-                      8 <small>sources</small>
-                    </strong>
+                    <Metric token="channels" t={t} className="dash-number" />
                     <em>
                       <i />
                       {d.integration}
@@ -251,7 +493,21 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
                   </div>
                   <div>
                     <span>{d.profit}</span>
-                    <strong className="dash-empty">—</strong>
+                    <Metric
+                      token="netProfit"
+                      t={t}
+                      className="dash-number"
+                      metric={{
+                        id: "report.netProfit",
+                        value: null,
+                        quality: QUALITY.UNAVAILABLE,
+                        asOf: data && data.updatedAt,
+                        demo: false,
+                        source: `${SOURCE_LABEL.report} · metrics`,
+                        note: "The hub investor report does not publish net profit yet.",
+                      }}
+                      format={(v) => money(v)}
+                    />
                     <em className="muted">
                       <i />
                       {d.unavailable}
@@ -274,23 +530,32 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
                   <div className="chart-caption">{d.eventNote}</div>
                 </div>
                 <div className="dash-game-table">
-                  {t.games.map((g, i) => (
-                    <div key={g.name}>
+                  {gameRows.map((row) => (
+                    <div key={row.name}>
                       <span>
-                        <i style={{ background: fundColors[i] }} />
-                        {g.name}
+                        <i style={{ background: row.color }} />
+                        {row.name}
                       </span>
                       <span
                         className={
-                          g.stage === "prototype" ? "purple-text" : "green-text"
+                          row.stage === "prototype" ? "purple-text" : "green-text"
                         }
                       >
-                        {g.stage}
+                        {row.stage}
                       </span>
-                      <span className="quality-label">unavailable</span>
+                      <span className="quality-cell">
+                        <QualityBadge quality={row.quality} t={t} />
+                        {row.demo && <DemoChip t={t} />}
+                      </span>
                     </div>
                   ))}
                 </div>
+                {!live && (
+                  <div className="dash-placeholder">
+                    <Info size={16} />
+                    {d.noLive}
+                  </div>
+                )}
               </>
             )}
             {tab === 1 && (
@@ -303,14 +568,25 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
                   <Badge color="orange">partial</Badge>
                 </div>
                 <div className="funnel">
-                  {d.funnelStages.map((name, i) => (
-                    <div key={name} style={{ width: `${100 - i * 17}%` }}>
-                      <span>{name}</span>
-                      <b>—</b>
-                    </div>
-                  ))}
+                  {d.funnelStages.map((name, i) => {
+                    const stage = funnelStages
+                      ? funnelStages.find((entry) => entry && entry.stage === i + 1) ||
+                        funnelStages[i]
+                      : null;
+                    return (
+                      <div key={name} style={{ width: `${100 - i * 17}%` }}>
+                        <span>{name}</span>
+                        <b>{stage && typeof stage.count === "number" ? stage.count : "—"}</b>
+                      </div>
+                    );
+                  })}
                 </div>
                 <p className="chart-caption">{d.funnelNote}</p>
+                {funnelStages && (
+                  <p className="dash-source mono">
+                    <Link2 size={11} /> {SOURCE_LABEL.readModel} · funnel
+                  </p>
+                )}
                 <div className="dash-placeholder">
                   <Info size={16} />
                   {d.noLive}
@@ -330,22 +606,32 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
                   <div>
                     <span>Ecosystem Share</span>
                     <strong>
-                      0.25<small>%</small>
+                      {sharePerNft}
+                      <small>%</small>
                     </strong>
                     <p>{t.nftProfit}</p>
                   </div>
                   <LockKeyhole size={46} />
                 </div>
-                {[d.report, d.snapshots].map((s) => (
-                  <div className="dash-report" key={s}>
-                    <span>
-                      <FileText size={16} />
-                      {s}
-                    </span>
-                    <span>—</span>
-                  </div>
-                ))}
+                <div className="dash-report">
+                  <span>
+                    <FileText size={16} />
+                    {d.report}
+                  </span>
+                  <span className="mono">{SOURCE_LABEL.report}</span>
+                </div>
+                <div className="dash-report">
+                  <span>
+                    <FileText size={16} />
+                    {d.snapshots}
+                  </span>
+                  <span className="mono">{SOURCE_LABEL.snapshots}</span>
+                </div>
                 <p className="chart-caption">{d.investorNote}</p>
+                <p className="dash-source mono">
+                  <Link2 size={11} />
+                  {t.snapshots.calendar}
+                </p>
               </div>
             )}
             {tab === 3 && (
@@ -358,26 +644,33 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
                   <Badge color="orange">partial</Badge>
                 </div>
                 <div className="traffic-demo-stats">
-                  {[5, 8, 6].map((v, i) => (
-                    <div key={i}>
-                      <strong>{v}</strong>
+                  {["campaigns", "trafficSources", "targetPages"].map((token, i) => (
+                    <div key={token}>
+                      <Metric token={token} t={t} />
                       <span>{t.trafficStats[i]}</span>
                     </div>
                   ))}
+                  <div>
+                    <Metric token="adSpend" t={t} format={(v) => money(v)} />
+                    <span>{t.trafficStats[3]}</span>
+                  </div>
                 </div>
-                {[
-                  "SEO / GEO",
-                  "X / Blinks",
-                  "Shorts / TikTok / Reels",
-                  "Whale radar",
-                  "TipLink",
-                ].map((s) => (
+                {channelNames.map((s) => (
                   <div className="dash-report" key={s}>
                     <span>
                       <CircleDot size={12} />
                       {s}
                     </span>
-                    <span className="quality-label">unavailable</span>
+                    <span className="quality-cell">
+                      <QualityBadge
+                        quality={
+                          live && data.campaigns
+                            ? QUALITY.PARTIAL
+                            : QUALITY.UNAVAILABLE
+                        }
+                        t={t}
+                      />
+                    </span>
                   </div>
                 ))}
                 <p className="chart-caption">
@@ -393,7 +686,13 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
           <span className="status-dot" />
           {d.preview}
         </span>
-        <span>{d.noLive}</span>
+        <span className="mono">
+          {live
+            ? data.updatedAt
+              ? `${t.data.updated}: ${stampUtc(data.updatedAt)}`
+              : t.data.readOnly
+            : d.noLive}
+        </span>
         {!compact && (
           <button
             aria-label={expanded ? d.collapse : d.expand}
@@ -405,6 +704,559 @@ function Dashboard({ t, compact = false, initialTab = 0, onTabChange }) {
       </div>
     </div>
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * Studio status screen — GET /api/ecosystem/status (interlock i-13)
+ * ------------------------------------------------------------------ */
+
+const STATUS_SCHEMA = [
+  "{",
+  '  "generatedAt": "2026-09-23T00:00:00.000Z",',
+  '  "source": "hub",',
+  '  "dataQuality": "complete | partial | unavailable",',
+  '  "levels": [{ "id": "L0", "definition": "..." }],',
+  '  "games": [{ "id": "ares1", "name": "ARES-1", "stage": "beta",',
+  '              "level": "L1", "connected": ["watchtower-api"],',
+  '              "disconnected": [{ "id": "game-events", "reason": "..." }] }],',
+  '  "apps": [{ "id": "watchtower-api", "name": "Watchtower API",',
+  '             "level": "L1", "connected": false, "reason": "..." }]',
+  "}",
+]; // numbers-lint-ignore (schema documentation, not a displayed figure)
+
+function StatusRow({ item, t, demo }) {
+  const connected = item.connectedFlag === true;
+  const disconnected = item.connectedFlag === false;
+  return (
+    <div className="status-row" data-connected={connected ? "true" : "false"}>
+      <div className="status-row-head">
+        <strong>{item.name}</strong>
+        {item.level && <span className="mono level-chip">{item.level}</span>}
+        {item.stage && <span className="mono stage-chip">{item.stage}</span>}
+        {connected && (
+          <Badge color="green" dot>
+            <Link2 size={11} /> {t.hub.connected}
+          </Badge>
+        )}
+        {(disconnected || !connected) && (
+          <Badge color="gray" dot>
+            <Link2Off size={11} /> {t.hub.disconnected}
+          </Badge>
+        )}
+        {demo && <DemoChip t={t} />}
+      </div>
+      {item.connected.length > 0 && (
+        <ul className="status-list">
+          {item.connected.map((entry) => (
+            <li key={entry}>
+              <Link2 size={11} />
+              <span className="mono">{entry}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {item.disconnected.length > 0 && (
+        <ul className="status-list off">
+          {item.disconnected.map((entry) => (
+            <li key={entry.id}>
+              <Link2Off size={11} />
+              <span className="mono">{entry.id}</span>
+              {entry.reason && <em>{entry.reason}</em>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {item.notes && <p className="status-note">{item.notes}</p>}
+    </div>
+  );
+}
+
+function EcosystemStatus({ t, status, inventory, onRetry, updatedAt }) {
+  const normalized =
+    status.status === "ok" ? normalizeEcosystemStatus(status.data) : null;
+  const reason =
+    status.status === "ok" && !normalized ? "not_json" : status.reason;
+  const levels =
+    normalized && normalized.levels.length > 0 ? normalized.levels : t.hub.levels.map(([id, definition]) => ({ id, definition }));
+  const demo = Boolean(normalized && normalized.demo);
+
+  return (
+    <section className="section status-section" id="status">
+      <div className="container">
+        <SectionHeader label={t.hub.label} title={t.hub.title} body={t.hub.body}>
+          <span className="section-side-note mono">
+            <Server size={13} /> {t.hub.endpoint}{" "}
+            <span className="green-text">{SOURCE_LABEL.ecosystemStatus}</span>
+          </span>
+        </SectionHeader>
+
+        <DataStateBar
+          state={status.status === "ok" ? "ready" : "unavailable"}
+          reason={reason}
+          t={t}
+          onRetry={onRetry}
+          updatedAt={updatedAt}
+          demo={demo}
+        />
+
+        <div className="status-levels">
+          <div className="status-levels-head">
+            <h3>{t.hub.levelsTitle}</h3>
+            <p>{t.hub.levelsNote}</p>
+          </div>
+          <ol className="level-legend">
+            {levels.map((level) => (
+              <li key={level.id}>
+                <span className="mono level-chip">{level.id}</span>
+                <p>{level.definition}</p>
+              </li>
+            ))}
+          </ol>
+        </div>
+
+        {normalized && (normalized.games.length > 0 || normalized.apps.length > 0) ? (
+          <div className="status-grid">
+            <div className="status-column">
+              <h3>
+                <Boxes size={14} /> {t.hub.games}
+              </h3>
+              {normalized.games.map((game) => (
+                <StatusRow item={game} t={t} demo={demo} key={game.id} />
+              ))}
+            </div>
+            <div className="status-column">
+              <h3>
+                <Server size={14} /> {t.hub.apps}
+              </h3>
+              {normalized.apps.map((app) => (
+                <StatusRow item={app} t={t} demo={demo} key={app.id} />
+              ))}
+              <p className="caption">{t.hub.appsNote}</p>
+            </div>
+          </div>
+        ) : (
+          <div className="status-pending">
+            <div className="status-pending-copy">
+              <h3>
+                <AlertTriangle size={16} /> {t.hub.pendingTitle}
+              </h3>
+              <p>{t.hub.pendingBody}</p>
+              <p className="mono">{t.hub.pendingNext}</p>
+            </div>
+            <div className="status-pending-copy">
+              <h3>
+                <Link2Off size={16} /> {t.hub.inventoryTitle}
+              </h3>
+              <p>{t.hub.inventoryNote}</p>
+              <div className="status-inventory">
+                <Metric
+                  token="configuredAdapters"
+                  t={t}
+                  metric={{
+                    ...staticMetric("configuredAdapters"),
+                    value:
+                      inventory && inventory.configured !== undefined
+                        ? inventory.configured
+                        : null,
+                    demo: Boolean(inventory && inventory.demo),
+                    source: SOURCE_LABEL.readModel,
+                    asOf: inventory && inventory.asOf,
+                  }}
+                  format={(v) => `${v} / ${inventory && inventory.total !== undefined ? inventory.total : "—"}`}
+                />
+                <span className="status-inventory-label">{t.hub.adaptersLabel}</span>
+              </div>
+            </div>
+            <div className="status-pending-copy">
+              <h3>
+                <Gauge size={16} /> {t.hub.schemaTitle}
+              </h3>
+              <p>{t.hub.schemaNote}</p>
+              {/* The schema line wraps on narrow screens and scrolls on wide
+                  ones; a scrollable region must be reachable by keyboard. */}
+              <pre
+                className="status-schema mono"
+                tabIndex={0}
+                aria-label={t.hub.schemaTitle}
+              >
+                <code>{STATUS_SCHEMA.join("\n")}</code>
+              </pre>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Snapshots and dividends — GET /api/investors/snapshots (interlock i-05)
+ * ------------------------------------------------------------------ */
+
+function snapshotsTableHead(t) {
+  return t.snapshots.tableHead;
+}
+
+function SnapshotRows({ rows, t }) {
+  return rows.map((row) => {
+    const share = row.profit === null ? null : calculateShare(row.profit, config.supply, config.poolPercent);
+    const zero = row.profit === 0;
+    return (
+      <tr key={row.id || row.period}>
+        <td data-label={t.snapshots.tableHead[0]}>
+          <span className="mono">{row.period || "—"}</span>
+        </td>
+        <td data-label={t.snapshots.tableHead[1]}>
+          <span className="mono">{row.createdAt ? isoDay(row.createdAt) : "—"}</span>
+        </td>
+        <td data-label={t.snapshots.tableHead[2]}>
+          <Metric
+            token="snapshotProfit"
+            t={t}
+            metric={{
+              id: `profit:${row.id}`,
+              value: row.profit,
+              quality: row.quality,
+              asOf: row.createdAt,
+              demo: row.demo,
+              source: `${SOURCE_LABEL.snapshots} · snapshotId ${row.id}`,
+              note: "Net profit for the quarter as published by the hub.",
+            }}
+            format={(v) => money(v, 2)}
+          />
+        </td>
+        <td data-label={t.snapshots.tableHead[3]}>
+          <span className="mono">{share ? moneyOrDash(share.pool, 2) : "—"}</span>
+        </td>
+        <td data-label={t.snapshots.tableHead[4]}>
+          <span className="mono">{share ? moneyOrDash(share.quarterly, 2) : "—"}</span>
+        </td>
+        <td data-label={t.snapshots.tableHead[5]}>
+          {zero ? (
+            <span className="zero-note">
+              <CircleDot size={11} /> {t.snapshots.statusZero}
+            </span>
+          ) : (
+            <Badge color={row.immutable ? "green" : "orange"} dot>
+              {row.immutable ? t.snapshots.statusPublished : t.snapshots.statusPending}
+            </Badge>
+          )}
+        </td>
+        <td data-label={t.snapshots.tableHead[6]}>
+          <a className="mono source-link" href={row.href}>
+            {SOURCE_LABEL.snapshots}
+            <ArrowUpRight size={11} />
+          </a>
+        </td>
+      </tr>
+    );
+  });
+}
+
+function Snapshots({ t, snapshots, state, reason, onRetry, updatedAt }) {
+  const rows = snapshots.status === "ok" ? snapshots.rows : [];
+  const demo = rows.some((row) => row.demo);
+  const upcoming = snapshotDates(new Date().getUTCFullYear()).concat(
+    snapshotDates(new Date().getUTCFullYear() + 1),
+  );
+  const next = nextSnapshot(new Date());
+  const illustration = explainShareIllustration(t);
+
+  return (
+    <section className="section snapshots-section" id="snapshots">
+      <div className="container">
+        <SectionHeader
+          label={t.snapshots.label}
+          title={t.snapshots.title}
+          body={t.snapshots.body}
+        >
+          <span className="section-side-note mono">
+            {SOURCE_LABEL.snapshots}
+          </span>
+        </SectionHeader>
+
+        <div className="snapshot-top">
+          <div className="formula">
+            <span>ƒ(x)</span>
+            <code>{t.snapshots.formula}</code>
+            <Check size={20} />
+          </div>
+          <p className="caption">
+            <Info size={13} />
+            {t.snapshots.formulaNote}
+          </p>
+        </div>
+
+        <div className="snapshot-meta-grid">
+          <div className="snapshot-meta">
+            <h3>
+              <Clock size={14} /> {t.snapshots.calendarTitle}
+            </h3>
+            <p>{t.snapshots.calendar}</p>
+            <ul className="date-list mono">
+              {upcoming.slice(0, 4).map((item) => (
+                <li key={isoDay(item.date)}>
+                  {isoDay(item.date)}
+                  <span>
+                    Q{quarterForMonth(item.month)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <p className="caption">{t.snapshots.calendarNote}</p>
+          </div>
+          <div className="snapshot-meta">
+            <h3>
+              <Wallet size={14} /> {t.snapshots.holderTitle}
+            </h3>
+            <p>{t.snapshots.holder}</p>
+            <p className="next-snapshot">
+              <b>{t.snapshots.nextTitle}:</b>{" "}
+              <span className="mono">{next ? isoDay(next.date) : "—"}</span>
+            </p>
+          </div>
+          <div className="snapshot-meta">
+            <h3>
+              <CircleDot size={14} /> {t.snapshots.zeroTitle}
+            </h3>
+            <p>{t.snapshots.zero}</p>
+          </div>
+        </div>
+
+        <DataStateBar
+          state={state}
+          reason={reason}
+          t={t}
+          onRetry={onRetry}
+          updatedAt={updatedAt}
+          demo={demo}
+        />
+
+        <div className="scenario-table snapshot-table">
+          <table>
+            <thead>
+              <tr>
+                {snapshotsTableHead(t).map((head) => (
+                  <th scope="col" key={head}>
+                    {head}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length > 0 ? (
+                <SnapshotRows rows={rows} t={t} />
+              ) : (
+                <tr>
+                  <td colSpan={snapshotsTableHead(t).length} className="empty-cell">
+                    <span>{t.snapshots.empty}</span>
+                    <em>{t.snapshots.emptyWhy}</em>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="trend-strip">
+          <div className="trend-head">
+            <h3>
+              <Activity size={14} /> {t.snapshots.trendTitle}
+            </h3>
+            {state === "ready" && (
+              <Badge color="gray" dot>
+                {SOURCE_LABEL.trend}
+              </Badge>
+            )}
+          </div>
+          {t.snapshots.trendEmpty && (
+            <p className="caption">{t.snapshots.trendEmpty}</p>
+          )}
+        </div>
+
+        <div className="illustration-card">
+          <div>
+            <Badge color="orange">{t.scenarios}</Badge>
+            <h3>{t.snapshots.illustrationTitle}</h3>
+            <p>{t.snapshots.illustration}</p>
+            <p className="caption">{t.snapshots.illustrationNote}</p>
+          </div>
+          <div className="illustration-metric">
+            <Metric
+              token="scenarioPerNft"
+              t={t}
+              metric={illustration}
+              format={(v) => money(v)}
+            />
+            <span className="mono">/ NFT / year @ $200,000</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/** Illustration figure, computed from the formula, labelled "not a promise". */
+function explainShareIllustration(t) {
+  const profit = NUMBERS.scenarios.value[1];
+  const share = calculateShare(profit, config.supply, config.poolPercent);
+  return {
+    id: "illustration:annual-per-nft",
+    value: share.annual,
+    quality: QUALITY.PARTIAL,
+    asOf: NUMBERS.scenarios.asOf,
+    demo: false,
+    source: NUMBERS.scenarios.source,
+    formula: t.snapshots.formula,
+    note: t.snapshots.illustrationNote,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Legal boundaries, KYC/AML, mint transparency, operations (W4)
+ * ------------------------------------------------------------------ */
+
+function pendingValue(t, text) {
+  return <span className="pending-chip">{text}</span>;
+}
+
+function Compliance({ t, saleGate }) {
+  const { mint, legal, ops } = config;
+  return (
+    <section className="section compliance-section" id="compliance">
+      <div className="container">
+        <SectionHeader
+          label={t.compliance.label}
+          title={t.compliance.title}
+          body={t.compliance.disclaimerTitle}
+        />
+        <div className="compliance-grid">
+          <article className="compliance-card">
+            <h3>
+              <ScrollTextLike />
+              {t.compliance.disclaimerTitle}
+            </h3>
+            <p>{t.compliance.disclaimer}</p>
+            <h4>
+              <ShieldAlert size={13} /> {t.compliance.riskTitle}
+            </h4>
+            <ul className="risk-list">
+              {t.compliance.risks.map((risk) => (
+                <li key={risk}>{risk}</li>
+              ))}
+            </ul>
+          </article>
+
+          <article className="compliance-card">
+            <h3>
+              <Scale size={15} /> {t.compliance.kycTitle}
+            </h3>
+            <p>{t.compliance.kyc}</p>
+            <div className="compliance-row">
+              <span>{t.compliance.mintStatus}</span>
+              {legal.kycStatus === "pending"
+                ? pendingValue(t, t.compliance.kycPending)
+                : <b>{legal.kycStatus}</b>}
+            </div>
+            <div className="compliance-row">
+              <span>{t.compliance.jurisdictionTitle}</span>
+              {legal.restrictedJurisdictionsPublished ? (
+                <b>{legal.restrictedJurisdictions.join(", ")}</b>
+              ) : (
+                pendingValue(t, t.compliance.jurisdictionPending)
+              )}
+            </div>
+            <p>{t.compliance.jurisdiction}</p>
+            <div className="compliance-row">
+              <span>{t.compliance.taxTitle}</span>
+              {pendingValue(t, t.compliance.kycPending)}
+            </div>
+            <p>{t.compliance.tax}</p>
+          </article>
+
+          <article className="compliance-card">
+            <h3>
+              <Banknote size={15} /> {t.compliance.mintTitle}
+            </h3>
+            <p>{t.compliance.mint}</p>
+            <div className="compliance-row">
+              <span>{t.compliance.mintSupply}</span>
+              <Metric token="supply" t={t} format={(v) => `${v} NFT`} />
+            </div>
+            <div className="compliance-row">
+              <span>{t.compliance.mintStatus}</span>
+              {mint.addressPublished && mint.programAddress ? (
+                <b className="mono">{mint.programAddress}</b>
+              ) : (
+                pendingValue(t, t.compliance.mintInProgress)
+              )}
+            </div>
+            <div className="compliance-row">
+              <span>{t.compliance.mintMultisig}</span>
+              {mint.multisigPublished && mint.multisig ? (
+                <b className="mono">{mint.multisig}</b>
+              ) : (
+                pendingValue(t, t.compliance.mintInProgress)
+              )}
+            </div>
+            <div className="compliance-row">
+              <span>{t.compliance.mintAudit}</span>
+              {mint.auditUrl ? (
+                <a href={mint.auditUrl} target="_blank" rel="noreferrer" className="mono">
+                  {mint.auditUrl}
+                </a>
+              ) : (
+                pendingValue(t, t.compliance.mintInProgress)
+              )}
+            </div>
+            <div className="compliance-row">
+              <span>{t.compliance.walletTitle}</span>
+              <Metric token="walletLimit" t={t} format={(v) => `${v} ${t.perWallet}`} />
+            </div>
+            <p>{t.compliance.wallet}</p>
+          </article>
+
+          <article className="compliance-card">
+            <h3>
+              <FileText size={15} /> {t.compliance.termsTitle}
+            </h3>
+            <p>{t.compliance.terms}</p>
+            <div className="compliance-row">
+              <span>{t.offerTerms}</span>
+              {config.termsUrl ? (
+                <a href={config.termsUrl} target="_blank" rel="noreferrer">
+                  {t.offerTerms}
+                </a>
+              ) : (
+                pendingValue(t, t.termsBadge)
+              )}
+            </div>
+            <p className="caption">{t.compliance.reviewNote}</p>
+            <h4>
+              <Gauge size={13} /> {t.compliance.opsTitle}
+            </h4>
+            <p>{t.compliance.opsText}</p>
+            <div className="compliance-row">
+              <span>{t.compliance.opsPending}</span>
+              <Badge color="orange" dot>
+                {t.planned}
+              </Badge>
+            </div>
+            <div className="compliance-row">
+              <span>{t.compliance.mintStatus}</span>
+              <Badge color={saleGate ? "green" : "gray"} dot>
+                {saleGate ? t.saleLive : t.saleClosed}
+              </Badge>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ScrollTextLike() {
+  return <Gavel size={15} />;
 }
 
 function TowerArt() {
@@ -591,16 +1443,63 @@ function App() {
   const [menu, setMenu] = useState(false);
   const [terms, setTerms] = useState(false);
   const [contactNote, setContactNote] = useState(false);
-  const [annualProfit, setAnnualProfit] = useState(200000);
+  const [annualProfit, setAnnualProfit] = useState(
+    NUMBERS.scenarios.value[1],
+  );
   const [email, setEmail] = useState("");
   const [formStatus, setFormStatus] = useState("idle");
   const [activeSection, setActiveSection] = useState("");
+  const [hub, setHub] = useState({ state: "loading" });
+  const [reloadKey, setReloadKey] = useState(0);
+  const [startedAt] = useState(() => Date.now());
+  const [trapField, setTrapField] = useState("");
   const t = content[lang];
   const result = calculateShare(
     annualProfit,
     config.supply,
     config.poolPercent,
   );
+  const report = hub.report || { status: "loading" };
+  const readModel = (hub.readModel && hub.readModel.status === "ok" && hub.readModel.data) || null;
+  const traffic = (hub.traffic && hub.traffic.status === "ok" && hub.traffic.data) || null;
+  const dashboardData = React.useMemo(() => {
+    const payload = report.status === "ok" ? report.data : null;
+    const state =
+      report.status === "ok"
+        ? "ready"
+        : report.status === "loading"
+          ? "loading"
+          : "unavailable";
+    return {
+      state,
+      reason: report.reason,
+      metrics: payload
+        ? buildMetrics(
+            payload,
+            {
+              newPlayers: "newPlayers",
+              activePlayers: "activePlayers",
+              volume: "volume",
+              treasury: "treasury",
+              minted: "minted",
+              burned: "burned",
+            },
+            { sourceLabel: SOURCE_LABEL.report },
+          )
+        : {},
+      games: payload && Array.isArray(payload.games) ? payload.games : null,
+      funnel:
+        readModel && Array.isArray(readModel.funnel) ? readModel.funnel : null,
+      campaigns: traffic ? traffic.campaigns || [] : null,
+      demo: Boolean(payload && isDemo(payload)),
+      updatedAt: payload ? payload.generatedAt || null : null,
+    };
+  }, [report, readModel, traffic]);
+  const snapshotsResult = hub.snapshots || { status: "loading" };
+  const snapshotRows =
+    snapshotsResult.status === "ok"
+      ? normalizeSnapshots(snapshotsResult.data)
+      : [];
   const termsClose = React.useCallback(() => setTerms(false), []);
   useEffect(() => {
     function sync() {
@@ -612,13 +1511,18 @@ function App() {
   useEffect(() => {
     document.documentElement.lang = lang;
     document.title = t.metaTitle;
-    document.querySelector('meta[name="description"]').content =
-      t.metaDescription;
-    document.querySelector('meta[property="og:title"]').content = t.metaTitle;
-    document.querySelector('meta[property="og:description"]').content =
-      t.metaDescription;
-    document.querySelector('meta[property="og:locale"]').content =
-      lang === "ru" ? "ru_RU" : "en_US";
+    // Meta tags are updated defensively: a missing tag must never break the
+    // page after mount, and the share previews must follow the language.
+    const setMeta = (selector, content) => {
+      const node = document.querySelector(selector);
+      if (node) node.setAttribute("content", content);
+    };
+    setMeta('meta[name="description"]', t.metaDescription);
+    setMeta('meta[property="og:title"]', t.metaTitle);
+    setMeta('meta[property="og:description"]', t.metaDescription);
+    setMeta('meta[name="twitter:title"]', t.metaTitle);
+    setMeta('meta[name="twitter:description"]', t.metaDescription);
+    setMeta('meta[property="og:locale"]', lang === "ru" ? "ru_RU" : "en_US");
   }, [lang, t]);
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -642,6 +1546,27 @@ function App() {
     window.addEventListener("keydown", esc);
     return () => window.removeEventListener("keydown", esc);
   }, []);
+  /**
+   * Read the hub once on mount (and on explicit retry). A failed endpoint
+   * keeps its own failure; the page never substitutes another endpoint's
+   * number for a missing one.
+   */
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    setHub((current) => ({ ...current, state: "loading" }));
+    loadDashboardData({ signal: controller.signal }).then((results) => {
+      if (!active) return;
+      setHub({
+        state: results.report.status === "ok" ? "ready" : "unavailable",
+        ...results,
+      });
+    });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [reloadKey]);
   function changeLanguage(l) {
     const url = new URL(window.location.href);
     url.searchParams.set("lang", l);
@@ -649,13 +1574,43 @@ function App() {
     setLang(l);
     setMenu(false);
   }
+  /**
+   * Lead submission. Consent is recorded locally before the request goes out
+   * (interlock i-02) and the payload keeps the frozen four-key contract.
+   * Spam protection: a honeypot field, a minimum fill time and a cooldown.
+   */
   async function submit(e) {
     e.preventDefault();
     if (!config.formEndpoint) {
       setFormStatus("unavailable");
       return;
     }
+    const secondsOnPage = (Date.now() - startedAt) / 1000;
+    if (trapField.trim() || secondsOnPage < config.lead.minimumSubmitSeconds) {
+      // A bot filled the hidden field or submitted instantly: drop silently.
+      setFormStatus("idle");
+      return;
+    }
+    const previous = readConsents();
+    if (
+      previous &&
+      previous.lastSubmittedAt &&
+      (Date.now() - new Date(previous.lastSubmittedAt).getTime()) / 1000 <
+        config.lead.resubmitCooldownSeconds
+    ) {
+      setFormStatus("cooldown");
+      return;
+    }
+    const consents = {
+      email: true,
+      analytics: false,
+      version: "2026-09-23",
+      language: lang,
+      source: "watchtower-investor",
+      lastSubmittedAt: new Date().toISOString(),
+    };
     setFormStatus("sending");
+    writeConsents(consents);
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
@@ -667,11 +1622,16 @@ function App() {
             "Content-Type": "application/json",
             Accept: "application/json",
           },
-          body: JSON.stringify({
-            email,
-            language: lang,
-            source: "watchtower-investor",
-          }),
+          body: JSON.stringify(
+            buildLeadPayload({
+              email,
+              language: lang,
+              consents,
+              campaign: new URLSearchParams(window.location.search).get(
+                "campaign",
+              ),
+            }),
+          ),
           signal: controller.signal,
         });
       } finally {
@@ -687,6 +1647,14 @@ function App() {
       setFormStatus("error");
     }
   }
+  function markOptOut() {
+    writeConsents({
+      email: false,
+      analytics: false,
+      optedOutAt: new Date().toISOString(),
+      language: lang,
+    });
+  }
   const purchaseHref = saleReady ? config.marketplaceUrl : "#waitlist";
   return (
     <>
@@ -695,7 +1663,9 @@ function App() {
       </a>
       <header className="site-header">
         <div className="container header-inner">
-          <a href="#" className="logo-link" aria-label="Watchtower">
+          {/* The visible wordmark is the accessible name: an aria-label that
+              does not contain it is a WCAG 2.5.3 failure. */}
+          <a href="#top" className="logo-link">
             <Logo />
           </a>
           <nav
@@ -746,6 +1716,27 @@ function App() {
           </div>
         </div>
       </header>
+      <div className="provenance-bar">
+        <div className="container provenance-inner">
+          <span className="mono">
+            <Database size={12} /> {config.api.base} · {config.network} ·{" "}
+            {t.data.readOnly}
+          </span>
+          <span className="mono provenance-time">
+            <Clock size={12} />
+            {hub.state === "loading"
+              ? t.data.loading
+              : hub.state === "ready"
+                ? `${t.data.updated}: ${stampUtc(report.data && report.data.generatedAt)}`
+                : t.data.notUpdated}
+          </span>
+          <nav className="provenance-links" aria-label={t.hub.title}>
+            <a href="#status">{t.hub.navLabel}</a>
+            <a href="#snapshots">{t.snapshots.navLabel}</a>
+            <a href="#compliance">{t.compliance.navLabel}</a>
+          </nav>
+        </div>
+      </div>
       <main id="main">
         <section className="hero" id="top">
           <div className="hero-grid-bg" />
@@ -815,13 +1806,13 @@ function App() {
                 <div>
                   <span>ECOSYSTEM SHARE</span>
                   <strong>
-                    0.25<small>%</small>
+                    {sharePerNft}<small>%</small>
                   </strong>
                   <p>{t.nftProfit}</p>
                 </div>
                 <ArrowUpRight size={21} />
                 <div className="floating-bottom">
-                  <span>100 NFT</span>
+                  <span>{NUMBERS.supply.value} NFT</span>
                   <span>USDC · SOLANA</span>
                 </div>
               </div>
@@ -835,10 +1826,10 @@ function App() {
             <span>
               <span className="status-dot" />
               {t.plannedPresale}
-              <b>Q4 2026</b>
+              <b>{NUMBERS.roadmapDates.value[0]}</b>
             </span>
             <span className="mono">
-              100 NFT <span className="divider-slash">/</span>{" "}
+              {NUMBERS.supply.value} NFT <span className="divider-slash">/</span>{" "}
               {money(config.target)}
               <a href="#ecosystem" aria-label={t.nav[0]}>
                 <ArrowDown size={15} />
@@ -849,16 +1840,22 @@ function App() {
         <div className="stats-section">
           <div className="container">
             <div className="stats-grid">
-              {["4", "6", "1", "100"].map((n, i) => (
-                <div key={n} className="stat">
-                  <span className="stat-number">
-                    {n}
-                    <span>{i === 3 ? "NFT" : "↗"}</span>
-                  </span>
-                  <h3>{t.stats[i]}</h3>
-                  <p>{t.statsDetail[i]}</p>
-                </div>
-              ))}
+              {["games", "channels", "operatingSystems", "supply"].map(
+                (token, i) => (
+                  <div key={token} className="stat">
+                    <Metric
+                      token={token}
+                      t={t}
+                      className="stat-number"
+                      as="span"
+                    >
+                      <span>{i === 3 ? "NFT" : "↗"}</span>
+                    </Metric>
+                    <h3>{t.stats[i]}</h3>
+                    <p>{t.statsDetail[i]}</p>
+                  </div>
+                ),
+              )}
             </div>
             <p className="stats-note">
               <ShieldCheck size={13} />
@@ -948,6 +1945,13 @@ function App() {
             </div>
           </div>
         </section>
+        <EcosystemStatus
+          t={t}
+          status={hub.ecosystem || { status: "loading" }}
+          inventory={adapterInventory(hub.readModel)}
+          updatedAt={hub.ecosystem && hub.ecosystem.data ? hub.ecosystem.data.generatedAt : null}
+          onRetry={() => setReloadKey((key) => key + 1)}
+        />
         <section className="section games-section" id="ecosystem">
           <div className="container">
             <SectionHeader
@@ -966,7 +1970,10 @@ function App() {
                     <img
                       src={`${import.meta.env.BASE_URL}images/${gameImages[i]}.webp`}
                       alt={g.name + " — " + t.concept}
+                      width={418}
+                      height={941}
                       loading="lazy"
+                      decoding="async"
                     />
                     <Badge
                       color={g.stage === "prototype" ? "purple" : "green"}
@@ -1035,12 +2042,18 @@ function App() {
               </div>
               <Dashboard t={t} initialTab={3} />
               <div className="traffic-stat-grid">
-                {["5", "8", "6", "$0"].map((v, i) => (
-                  <div key={v}>
-                    <strong>{v}</strong>
-                    <span>{t.trafficStats[i]}</span>
-                  </div>
-                ))}
+                {["campaigns", "trafficSources", "targetPages", "adSpend"].map(
+                  (token, i) => (
+                    <div key={token}>
+                      <strong>
+                        {NUMBERS[token].unit === "USDC"
+                          ? money(NUMBERS[token].value)
+                          : NUMBERS[token].value}
+                      </strong>
+                      <span>{t.trafficStats[i]}</span>
+                    </div>
+                  ),
+                )}
               </div>
               <p className="caption">{t.trafficNote}</p>
             </div>
@@ -1086,7 +2099,7 @@ function App() {
                   <div className="nft-art-text">
                     <span>ECOSYSTEM SHARE</span>
                     <strong>
-                      0.25<span>%</span>
+                      {sharePerNft}<span>%</span>
                     </strong>
                     <p>{t.nftProfit}</p>
                   </div>
@@ -1100,10 +2113,20 @@ function App() {
                 <div className="offer-card-bottom">
                   <div className="offer-price">
                     <span>{t.offerPrice}</span>
-                    <strong>
-                      {money(config.price)}
-                      <small>USDC</small>
-                    </strong>
+                    {/* The price is a registry fact like every other figure:
+                        it carries its own quality badge and trace. */}
+                    <Metric
+                      as="strong"
+                      token="price"
+                      t={t}
+                      className="offer-price-value"
+                      format={(v) => (
+                        <>
+                          {money(v)}
+                          <small>USDC</small>
+                        </>
+                      )}
+                    />
                   </div>
                   <div className="offer-limit">
                     <span>{t.offerLimit}</span>
@@ -1185,7 +2208,7 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {[100000, 200000, 400000].map((n) => {
+                  {NUMBERS.scenarios.value.map((n) => {
                     const r = calculateShare(
                       n,
                       config.supply,
@@ -1226,12 +2249,15 @@ function App() {
                     id="profit-input"
                     type="number"
                     min="0"
-                    max="1000000"
-                    step="1000"
+                    max={NUMBERS.scenarioMax.value}
+                    step={NUMBERS.calcStep.value}
                     value={annualProfit}
                     onChange={(e) =>
                       setAnnualProfit(
-                        Math.min(1000000, Math.max(0, Number(e.target.value))),
+                        Math.min(
+                          NUMBERS.scenarioMax.value,
+                          Math.max(0, Number(e.target.value)),
+                        ),
                       )
                     }
                   />
@@ -1240,15 +2266,17 @@ function App() {
                   aria-label={t.calcLabel}
                   type="range"
                   min="0"
-                  max="1000000"
-                  step="1000"
+                  max={NUMBERS.scenarioMax.value}
+                  step={NUMBERS.calcStep.value}
                   value={annualProfit}
-                  style={{ "--range-progress": `${annualProfit / 10000}%` }}
+                  style={{
+                    "--range-progress": `${(annualProfit / NUMBERS.scenarioMax.value) * 100}%`,
+                  }}
                   onChange={(e) => setAnnualProfit(Number(e.target.value))}
                 />
                 <div className="range-labels">
-                  <span>$0</span>
-                  <span>$1,000,000</span>
+                  <span>{money(0)}</span>
+                  <span>{money(NUMBERS.scenarioMax.value)}</span>
                 </div>
               </div>
               <div className="calc-result" aria-live="polite">
@@ -1282,6 +2310,24 @@ function App() {
             </div>
           </div>
         </section>
+        <Snapshots
+          t={t}
+          snapshots={{ status: snapshotsResult.status, rows: snapshotRows, data: snapshotsResult.data }}
+          state={
+            snapshotsResult.status === "ok"
+              ? "ready"
+              : snapshotsResult.status === "loading"
+                ? "loading"
+                : "unavailable"
+          }
+          reason={snapshotsResult.reason}
+          updatedAt={
+            snapshotsResult.status === "ok" && snapshotsResult.data
+              ? snapshotsResult.data.generatedAt || null
+              : null
+          }
+          onRetry={() => setReloadKey((key) => key + 1)}
+        />
         <section className="section funds-section" id="funds">
           <div className="container">
             <SectionHeader
@@ -1295,7 +2341,8 @@ function App() {
                   <div>
                     <span>{t.fundTotal}</span>
                     <strong>
-                      $100<span>k</span>
+                      {money(config.target / 1000, 0)}
+                      <span>k</span>
                     </strong>
                     <span className="mono">USDC / SOLANA</span>
                   </div>
@@ -1314,8 +2361,8 @@ function App() {
                       <p>{description}</p>
                     </div>
                     <div className="fund-amount">
-                      <strong>{money(fundAmounts[i])}</strong>
-                      <span>{fundAmounts[i] / 1000}%</span>
+                      <strong>{money(NUMBERS.funds.value[i])}</strong>
+                      <span>{NUMBERS.fundPercents.value[i]}%</span>
                     </div>
                   </div>
                 ))}
@@ -1327,7 +2374,7 @@ function App() {
                 {t.milestoneLabel}
               </div>
               <div className="milestones">
-                {["50", "30", "20"].map((n, i) => (
+                {NUMBERS.milestoneSplit.value.map((n, i) => (
                   <div key={n}>
                     <strong>
                       {n}
@@ -1353,7 +2400,7 @@ function App() {
               {t.roadmap.map(([title, ...items], i) => (
                 <article key={title} className={i === 0 ? "next" : ""}>
                   <div className="roadmap-date">
-                    <span>{["Q4 2026", "Q1 2027", "Q2 2027"][i]}</span>
+                    <span>{NUMBERS.roadmapDates.value[i]}</span>
                     <Badge color={i === 0 ? "green" : "gray"}>
                       {t.planned}
                     </Badge>
@@ -1379,6 +2426,7 @@ function App() {
             </p>
           </div>
         </section>
+        <Compliance t={t} saleGate={saleReady} />
         <section className="section honesty-section">
           <div className="container">
             <SectionHeader label={t.honestyLabel} title={t.honestyTitle} />
@@ -1459,6 +2507,19 @@ function App() {
                   <label className="sr-only" htmlFor="email">
                     {t.emailLabel}
                   </label>
+                  {/* Honeypot: hidden from users and assistive tech, filled only by bots. */}
+                  <div className="hp-field" aria-hidden="true">
+                    <label htmlFor="company-website">Company website</label>
+                    <input
+                      id="company-website"
+                      name="company-website"
+                      type="text"
+                      tabIndex={-1}
+                      autoComplete="off"
+                      value={trapField}
+                      onChange={(e) => setTrapField(e.target.value)}
+                    />
+                  </div>
                   <div className="email-field">
                     <Mail size={18} />
                     <input
@@ -1510,8 +2571,16 @@ function App() {
                         ? t.formError
                         : formStatus === "unavailable"
                           ? t.formUnavailable
-                          : ""}
+                          : formStatus === "cooldown"
+                            ? t.formCooldown
+                            : ""}
                   </div>
+                  <p className="consent-journal mono">
+                    <ShieldCheck size={12} /> {t.consentSaved}{" "}
+                    <button type="button" className="text-button" onClick={markOptOut}>
+                      {t.optOut}
+                    </button>
+                  </p>
                 </form>
               )}
               <div className="waitlist-contact">
@@ -1548,8 +2617,12 @@ function App() {
               </a>
               <p>{t.footerNote}</p>
             </div>
-            <div>
+            <div className="footer-links">
               <span className="mono">LEO GAMES STUDIO</span>
+              <a href="#status">{t.hub.navLabel}</a>
+              <a href="#snapshots">{t.snapshots.navLabel}</a>
+              <a href="#compliance">{t.compliance.navLabel}</a>
+              <a href="#faq">{t.faqTitle}</a>
               <button className="text-button" onClick={() => setTerms(true)}>
                 {t.offerTerms}
                 <ArrowUpRight size={14} />
@@ -1576,8 +2649,29 @@ function App() {
     </>
   );
 }
-createRoot(document.getElementById("root")).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+/**
+ * The app renders itself only in a browser: the node smoke test
+ * (`tests/render.test.js`) imports this module through Vite's SSR loader and
+ * renders the components directly.
+ */
+const mountNode =
+  typeof document === "undefined" ? null : document.getElementById("root");
+if (mountNode) {
+  createRoot(mountNode).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  );
+}
+
+export {
+  App,
+  Dashboard,
+  Metric,
+  QualityBadge,
+  DataStateBar,
+  EcosystemStatus,
+  Snapshots,
+  Compliance,
+  calculateShare,
+};

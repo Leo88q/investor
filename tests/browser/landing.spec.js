@@ -44,7 +44,11 @@ test("four dashboard tabs work with mouse and keyboard", async ({ page }) => {
   await expect(dashboard).not.toHaveClass(/expanded/);
   await dashboard.getByRole("tab", { name: "Overview" }).click();
   await expect(dashboard.getByRole("tabpanel")).toContainText("No live data");
-  await expect(dashboard.getByText("DEMO DATA", { exact: true })).toBeVisible();
+  // The dashboard always carries a DEMO DATA label: the mockup badge, plus a
+  // chip on every metric that answers from the hub's mock mode.
+  await expect(
+    dashboard.getByText("DEMO DATA", { exact: true }).first(),
+  ).toBeVisible();
 });
 
 test("calculator updates correct scenarios and clamps losses to zero", async ({
